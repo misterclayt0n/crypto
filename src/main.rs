@@ -1,16 +1,13 @@
 use std::{
     cmp::Ordering,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read},
     path::PathBuf,
-    thread,
-    time::Duration,
 };
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
-use reqwest::{blocking::Client, StatusCode};
-use serde::{Deserialize, Serialize};
 use rand::Rng;
 
 fn main() -> Result<()> {
@@ -19,7 +16,9 @@ fn main() -> Result<()> {
     let ciphertext = args.read_input()?;
 
     let letter_freqs = parse_letter_freq_table()?;
-    let solver = Solver::new(args.steps, args.restarts, letter_freqs);
+    let dictionary = load_dictionary()?;
+    let soundex_index = build_soundex_index(&dictionary);
+    let solver = Solver::new(args.steps, args.restarts, letter_freqs, dictionary.clone(), soundex_index.clone());
     let result = solver.solve(&ciphertext)?;
 
     println!("{}", result.plaintext);
@@ -30,8 +29,10 @@ fn main() -> Result<()> {
         println!("{cipher} -> {plain}");
     }
 
-    let refinement = refine_with_llm(&result.plaintext)?;
-    println!("\nLLM response:\n{refinement}");
+    // Apply word segmentation and character corrections
+    let segmented = segment_and_correct(&result.plaintext, &dictionary);
+    println!("\nWord-segmented and corrected output:");
+    println!("{}", segmented);
 
     Ok(())
 }
@@ -47,11 +48,11 @@ struct Args {
     text: Option<String>,
 
     /// Number of hill-climbing steps to perform per restart
-    #[arg(short, long, default_value_t = 25_000)]
+    #[arg(short, long, default_value_t = 30_000)]
     steps: usize,
 
     /// Number of times to restart the search with a different key guess
-    #[arg(short, long, default_value_t = 30)]
+    #[arg(short, long, default_value_t = 50)]
     restarts: usize,
 }
 
@@ -81,12 +82,18 @@ struct Solver {
 }
 
 impl Solver {
-    fn new(steps: usize, restarts: usize, letter_freqs: [f64; 26]) -> Self {
+    fn new(
+        steps: usize,
+        restarts: usize,
+        letter_freqs: [f64; 26],
+        dictionary: HashSet<String>,
+        soundex_index: HashMap<String, Vec<String>>
+    ) -> Self {
         let plain_order = english_frequency_order(&letter_freqs);
         Self {
             steps,
             restarts,
-            model: ScoreModel::new(&letter_freqs),
+            model: ScoreModel::new(&letter_freqs, dictionary, soundex_index),
             plain_order,
         }
     }
@@ -142,10 +149,14 @@ impl Solver {
             }
 
             let plaintext = prepared.render(&best_restart_key);
+
+            // Use dictionary-based scoring for final evaluation
+            let final_score = self.model.score_with_text(&plaintext);
+
             let restart_result = SolverResult {
                 plaintext,
                 mapping: best_restart_key,
-                score: best_restart_score,
+                score: final_score,
             };
 
             match &mut best_overall {
@@ -274,12 +285,14 @@ fn english_frequency_order(letter_freqs: &[f64; 26]) -> [usize; 26] {
 
 struct ScoreModel {
     letter_log_probs: [f64; 26],
-    bigram_log_probs: [[f64; 26]; 26],        // ADD THIS
-    trigram_log_probs: [[[f64; 26]; 26]; 26], // ADD THIS
+    bigram_log_probs: [[f64; 26]; 26],
+    trigram_log_probs: [[[f64; 26]; 26]; 26],
+    dictionary: HashSet<String>,
+    soundex_index: HashMap<String, Vec<String>>,
 }
 
 impl ScoreModel {
-    fn new(letter_freqs: &[f64; 26]) -> Self {
+    fn new(letter_freqs: &[f64; 26], dictionary: HashSet<String>, soundex_index: HashMap<String, Vec<String>>) -> Self {
         let letter_total: f64 = letter_freqs.iter().sum();
         let letter_floor = (1.0 / (letter_total * 1000.0)).ln();
         let mut letter_log_probs = [0.0; 26];
@@ -316,6 +329,8 @@ impl ScoreModel {
             letter_log_probs,
             bigram_log_probs,
             trigram_log_probs,
+            dictionary,
+            soundex_index,
         }
     }
 
@@ -333,120 +348,375 @@ impl ScoreModel {
             total += self.bigram_log_probs[window[0]][window[1]];
         }
 
-        // 3. Trigrams (The connection between 3 letters)
         for window in letters.windows(3) {
             total += self.trigram_log_probs[window[0]][window[1]][window[2]];
         }
 
         total
     }
+
+    fn score_with_text(&self, text: &str) -> f64 {
+        let prepared = PreparedText::from(text);
+        let mut base_score = self.score(&prepared.letters);
+
+        // Add dictionary-based scoring with Soundex phonetic matching
+        let words: Vec<String> = text
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|w| w.len() >= 2)
+            .map(|w| w.to_lowercase())
+            .collect();
+
+        let mut word_score = 0.0;
+        let mut matched_words = 0;
+
+        for word in &words {
+            if self.dictionary.contains(word) {
+                // Exact match - highest bonus
+                word_score += (word.len() as f64) * 5.0;
+                matched_words += 1;
+            } else if word.len() >= 3 {
+                // Try Soundex phonetic matching
+                let soundex_code = soundex(word);
+                if let Some(similar_words) = self.soundex_index.get(&soundex_code) {
+                    if !similar_words.is_empty() {
+                        // Phonetic match - partial bonus
+                        word_score += (word.len() as f64) * 2.0;
+                        matched_words += 1;
+                    }
+                }
+            }
+        }
+
+        // Add word score weighted by match percentage
+        if !words.is_empty() {
+            let match_ratio = matched_words as f64 / words.len() as f64;
+            base_score += word_score * match_ratio;
+        }
+
+        base_score
+    }
 }
 
-const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+fn soundex(word: &str) -> String {
+    if word.is_empty() {
+        return String::from("0000");
+    }
 
-fn refine_with_llm(prompt: &str) -> Result<String> {
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .wrap_err("GEMINI_API_KEY environment variable must be set to call Gemini API")?;
+    let chars: Vec<char> = word.to_uppercase().chars().collect();
+    let mut code = String::new();
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .wrap_err("failed to construct HTTP client")?;
+    // Keep the first letter
+    code.push(chars[0]);
 
-    let request = LlmRequest {
-        contents: vec![LlmContent {
-            parts: vec![LlmPart {
-                text: prompt.to_string(),
-            }],
-        }],
-    };
+    let mut prev_code = get_soundex_code(chars[0]);
 
-    let mut delay = Duration::from_secs(1);
-    let max_attempts = 3;
-    let mut last_error = None;
-
-    for attempt in 0..max_attempts {
-        let response = client
-            .post(GEMINI_URL)
-            .header("X-goog-api-key", &api_key)
-            .json(&request)
-            .send()
-            .wrap_err("failed to contact Gemini API")?;
-
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            let body = response.text().unwrap_or_default();
-            last_error = Some(eyre!("Gemini API rate limited request: {body}"));
-            if attempt + 1 == max_attempts {
+    for &ch in &chars[1..] {
+        let curr_code = get_soundex_code(ch);
+        if curr_code != '0' && curr_code != prev_code {
+            code.push(curr_code);
+            if code.len() == 4 {
                 break;
             }
-            thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_secs(8));
+        }
+        if curr_code != '0' {
+            prev_code = curr_code;
+        }
+    }
+
+    // Pad with zeros to length 4
+    while code.len() < 4 {
+        code.push('0');
+    }
+
+    code
+}
+
+fn get_soundex_code(ch: char) -> char {
+    match ch {
+        'B' | 'F' | 'P' | 'V' => '1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+        'D' | 'T' => '3',
+        'L' => '4',
+        'M' | 'N' => '5',
+        'R' => '6',
+        _ => '0',
+    }
+}
+
+fn build_soundex_index(dictionary: &HashSet<String>) -> HashMap<String, Vec<String>> {
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+
+    for word in dictionary {
+        let code = soundex(word);
+        index.entry(code).or_insert_with(Vec::new).push(word.clone());
+    }
+
+    index
+}
+
+fn segment_and_correct(text: &str, dictionary: &HashSet<String>) -> String {
+    let mut result = String::new();
+    let mut current_segment = String::new();
+
+    for ch in text.chars() {
+        if ch.is_ascii_alphabetic() {
+            current_segment.push(ch);
+        } else {
+            if !current_segment.is_empty() {
+                let segmented = segment_words(&current_segment.to_lowercase(), dictionary);
+                // Preserve capitalization of first letter
+                if current_segment.chars().next().unwrap().is_uppercase() && !segmented.is_empty() {
+                    let mut chars = segmented.chars();
+                    result.push(chars.next().unwrap().to_ascii_uppercase());
+                    result.push_str(&chars.collect::<String>());
+                } else {
+                    result.push_str(&segmented);
+                }
+                current_segment.clear();
+            }
+            result.push(ch);
+        }
+    }
+
+    // Handle last segment
+    if !current_segment.is_empty() {
+        let segmented = segment_words(&current_segment.to_lowercase(), dictionary);
+        if current_segment.chars().next().unwrap().is_uppercase() && !segmented.is_empty() {
+            let mut chars = segmented.chars();
+            result.push(chars.next().unwrap().to_ascii_uppercase());
+            result.push_str(&chars.collect::<String>());
+        } else {
+            result.push_str(&segmented);
+        }
+    }
+
+    // Apply character-level corrections for common cipher errors
+    let corrected = apply_character_corrections(&result, dictionary);
+
+    // Final validation: only output words that exist in dictionary
+    validate_all_words(&corrected, dictionary)
+}
+
+fn validate_all_words(text: &str, dictionary: &HashSet<String>) -> String {
+    text.split_whitespace()
+        .filter(|word| {
+            let clean = word.to_lowercase().trim_matches(|c: char| !c.is_ascii_alphabetic()).to_string();
+            !clean.is_empty() && (dictionary.contains(&clean) || clean == "a" || clean == "i")
+        })
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+fn segment_words(text: &str, dictionary: &HashSet<String>) -> String {
+    let n = text.len();
+    if n == 0 {
+        return String::new();
+    }
+
+    // dp[i] = (best_score, best_split_position)
+    let mut dp: Vec<(f64, Option<usize>)> = vec![(-1e9, None); n + 1];
+    dp[0] = (0.0, None);
+
+    // Common single letter words
+    let single_letter_words: HashSet<&str> = ["a", "i"].iter().cloned().collect();
+
+    for i in 0..n {
+        if dp[i].0 < -1e8 {
             continue;
         }
 
-        if !status.is_success() {
-            let body = response.text().unwrap_or_default();
-            return Err(eyre!("Gemini API returned status {status}: {body}"));
+        // Try all possible words starting at position i
+        let max_word_len = 20.min(n - i);
+        for len in 1..=max_word_len {
+            let j = i + len;
+            let word = &text[i..j];
+            let mut score = dp[i].0;
+
+            if dictionary.contains(word) {
+                // Strong preference for dictionary words, heavily weight by length
+                score += (len as f64).powi(2) * 5.0;
+            } else if len == 1 && single_letter_words.contains(word) {
+                score += 2.0;
+            } else if len <= 2 {
+                // Small penalty for very short unknown words
+                score -= 3.0;
+            } else {
+                // Strong penalty for longer unknown words
+                score -= len as f64 * 8.0;
+            }
+
+            if score > dp[j].0 {
+                dp[j] = (score, Some(i));
+            }
         }
-
-        let response: LlmResponse = response
-            .json()
-            .wrap_err("failed to parse response from Gemini API")?;
-
-        return response
-            .candidates
-            .and_then(|candidates| {
-                candidates.into_iter().find_map(|candidate| {
-                    candidate.content.and_then(|content| {
-                        content
-                            .parts
-                            .into_iter()
-                            .find_map(|part| part.text)
-                    })
-                })
-            })
-            .ok_or_else(|| eyre!("Gemini API response did not contain text"));
     }
 
-    Err(last_error.unwrap_or_else(|| eyre!("failed to contact Gemini API")))
+    // Reconstruct the best segmentation
+    let mut words = Vec::new();
+    let mut pos = n;
+    while pos > 0 {
+        if let Some(prev_pos) = dp[pos].1 {
+            words.push(&text[prev_pos..pos]);
+            pos = prev_pos;
+        } else {
+            // Fallback: take one character at a time
+            words.push(&text[pos - 1..pos]);
+            pos -= 1;
+        }
+    }
+
+    words.reverse();
+
+    // Validate: only keep words that exist in dictionary (or are single letters a/i)
+    let valid_words: Vec<String> = words.iter()
+        .map(|&w| {
+            if dictionary.contains(w) || w == "a" || w == "i" {
+                w.to_string()
+            } else {
+                // Try to further segment this word
+                re_segment_word(w, dictionary)
+            }
+        })
+        .collect();
+
+    valid_words.join(" ")
 }
 
-#[derive(Serialize)]
-struct LlmRequest {
-    contents: Vec<LlmContent>,
+fn re_segment_word(word: &str, dictionary: &HashSet<String>) -> String {
+    // Try to break down a non-dictionary word into smaller valid words
+    let n = word.len();
+    if n <= 2 {
+        return word.to_string();
+    }
+
+    // Try all split points
+    for i in 1..n {
+        let left = &word[0..i];
+        let right = &word[i..n];
+
+        if dictionary.contains(left) && dictionary.contains(right) {
+            return format!("{} {}", left, right);
+        }
+    }
+
+    // Try three-way split for longer words
+    if n >= 5 {
+        for i in 1..n-1 {
+            for j in i+1..n {
+                let left = &word[0..i];
+                let mid = &word[i..j];
+                let right = &word[j..n];
+
+                if dictionary.contains(left) && dictionary.contains(mid) && dictionary.contains(right) {
+                    return format!("{} {} {}", left, mid, right);
+                }
+            }
+        }
+    }
+
+    // Can't segment it, return as-is
+    word.to_string()
 }
 
-#[derive(Serialize)]
-struct LlmContent {
-    parts: Vec<LlmPart>,
+fn apply_character_corrections(text: &str, dictionary: &HashSet<String>) -> String {
+    let mut best_text = text.to_string();
+    let mut best_score = score_text(&best_text, dictionary);
+
+    // Try systematic pair swaps (characters that might be confused)
+    let swap_pairs = [
+        ('m', 'b'),
+        ('p', 'y'),
+        ('v', 'p'),
+        ('j', 'x'),
+        ('w', 'v'),
+        ('q', 'a'),
+    ];
+
+    // Try each swap and combinations of swaps
+    let mut improved = true;
+    while improved {
+        improved = false;
+
+        for &(c1, c2) in &swap_pairs {
+            let test_text = swap_chars(&best_text, c1, c2);
+            let test_score = score_text(&test_text, dictionary);
+
+            if test_score > best_score {
+                best_score = test_score;
+                best_text = test_text;
+                improved = true;
+            }
+        }
+    }
+
+    best_text
 }
 
-#[derive(Serialize)]
-struct LlmPart {
-    text: String,
+fn swap_chars(text: &str, c1: char, c2: char) -> String {
+    text.chars().map(|ch| {
+        if ch == c1 {
+            c2
+        } else if ch == c2 {
+            c1
+        } else if ch == c1.to_ascii_uppercase() {
+            c2.to_ascii_uppercase()
+        } else if ch == c2.to_ascii_uppercase() {
+            c1.to_ascii_uppercase()
+        } else {
+            ch
+        }
+    }).collect()
 }
 
-#[derive(Deserialize)]
-struct LlmResponse {
-    #[serde(default)]
-    candidates: Option<Vec<LlmCandidate>>,
+fn score_text(text: &str, dictionary: &HashSet<String>) -> f64 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut score = 0.0;
+    let mut matched = 0;
+
+    for word in &words {
+        let lower = word.to_lowercase().trim_matches(|c: char| !c.is_ascii_alphabetic()).to_string();
+        if !lower.is_empty() {
+            if dictionary.contains(&lower) {
+                // Strong bonus for dictionary words, heavily weighted by length
+                score += (lower.len() as f64).powi(2) * 3.0;
+                matched += 1;
+            } else {
+                // Penalty for non-dictionary words
+                score -= 5.0;
+            }
+        }
+    }
+
+    // Bonus for high match ratio
+    if !words.is_empty() {
+        let match_ratio = matched as f64 / words.len() as f64;
+        score *= 1.0 + match_ratio;
+    }
+
+    score
 }
 
-#[derive(Deserialize)]
-struct LlmCandidate {
-    content: Option<LlmContentResponse>,
-}
+fn load_dictionary() -> Result<HashSet<String>> {
+    let path = "english Dictionary.csv";
+    let content = fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read dictionary file: {}", path))?;
 
-#[derive(Deserialize)]
-struct LlmContentResponse {
-    #[serde(default)]
-    parts: Vec<LlmPartResponse>,
-}
+    let mut dictionary = HashSet::new();
+    for (line_no, line) in content.lines().enumerate() {
+        if line_no == 0 || line.trim().is_empty() {
+            continue;
+        }
 
-#[derive(Deserialize)]
-struct LlmPartResponse {
-    text: Option<String>,
+        if let Some(word) = line.split(',').next() {
+            let word = word.trim().to_lowercase();
+            // Only include words 2-15 characters long
+            if word.len() >= 2 && word.len() <= 15 && word.chars().all(|c| c.is_ascii_alphabetic()) {
+                dictionary.insert(word);
+            }
+        }
+    }
+
+    Ok(dictionary)
 }
 
 const LETTER_FREQ_TABLE: &str = include_str!("../frequency_table/table1.csv");
