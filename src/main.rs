@@ -455,10 +455,14 @@ fn build_soundex_index(dictionary: &HashSet<String>) -> HashMap<String, Vec<Stri
 }
 
 fn segment_and_correct(text: &str, dictionary: &HashSet<String>) -> String {
+    // STEP 1: Apply character-level corrections FIRST on the raw concatenated text
+    let char_corrected = apply_character_corrections_to_raw(text, dictionary);
+
+    // STEP 2: Now segment the corrected text into words
     let mut result = String::new();
     let mut current_segment = String::new();
 
-    for ch in text.chars() {
+    for ch in char_corrected.chars() {
         if ch.is_ascii_alphabetic() {
             current_segment.push(ch);
         } else {
@@ -490,21 +494,85 @@ fn segment_and_correct(text: &str, dictionary: &HashSet<String>) -> String {
         }
     }
 
-    // Apply character-level corrections for common cipher errors
-    let corrected = apply_character_corrections(&result, dictionary);
+    // STEP 3: Final validation - only output dictionary words
+    validate_all_words(&result, dictionary)
+}
 
-    // Final validation: only output words that exist in dictionary
-    validate_all_words(&corrected, dictionary)
+fn apply_character_corrections_to_raw(text: &str, dictionary: &HashSet<String>) -> String {
+    let mut best_text = text.to_string();
+    let mut best_score = score_raw_text(&best_text, dictionary);
+
+    // Try systematic pair swaps on the RAW unsegmented text
+    let swap_pairs = [
+        ('m', 'b'),
+        ('p', 'y'),
+        ('v', 'p'),
+        ('j', 'x'),
+        ('y', 'v'),
+        ('b', 'm'),
+    ];
+
+    // Try multiple passes of swaps
+    for _ in 0..3 {
+        let mut improved = false;
+
+        for &(c1, c2) in &swap_pairs {
+            let test_text = swap_chars(&best_text, c1, c2);
+            let test_score = score_raw_text(&test_text, dictionary);
+
+            if test_score > best_score {
+                best_score = test_score;
+                best_text = test_text;
+                improved = true;
+            }
+        }
+
+        if !improved {
+            break;
+        }
+    }
+
+    best_text
+}
+
+fn score_raw_text(text: &str, dictionary: &HashSet<String>) -> f64 {
+    // Score by counting how many dictionary words can be found as substrings
+    let lower = text.to_lowercase();
+    let mut score = 0.0;
+
+    // Check for all dictionary words as substrings
+    for word in dictionary.iter() {
+        if word.len() >= 4 {  // Only check longer words to avoid false positives
+            let count = lower.matches(word.as_str()).count();
+            if count > 0 {
+                score += (word.len() as f64).powi(2) * count as f64;
+            }
+        }
+    }
+
+    score
 }
 
 fn validate_all_words(text: &str, dictionary: &HashSet<String>) -> String {
-    text.split_whitespace()
+    // Common single/double letter words that might not be in dictionary
+    let common_words: HashSet<&str> = [
+        "a", "i", "to", "of", "in", "on", "at", "is", "it", "or", "as", "be",
+    ].iter().cloned().collect();
+
+    let words: Vec<&str> = text.split_whitespace()
         .filter(|word| {
-            let clean = word.to_lowercase().trim_matches(|c: char| !c.is_ascii_alphabetic()).to_string();
-            !clean.is_empty() && (dictionary.contains(&clean) || clean == "a" || clean == "i")
+            let clean = word.to_lowercase()
+                .trim_matches(|c: char| !c.is_ascii_alphabetic())
+                .to_string();
+            if clean.is_empty() {
+                return false;
+            }
+            // Only keep words that are in the dictionary or common words
+            dictionary.contains(&clean) || common_words.contains(clean.as_str())
         })
-        .collect::<Vec<&str>>()
-        .join(" ")
+        .collect();
+
+    words.join(" ")
 }
 
 fn segment_words(text: &str, dictionary: &HashSet<String>) -> String {
@@ -618,39 +686,6 @@ fn re_segment_word(word: &str, dictionary: &HashSet<String>) -> String {
     word.to_string()
 }
 
-fn apply_character_corrections(text: &str, dictionary: &HashSet<String>) -> String {
-    let mut best_text = text.to_string();
-    let mut best_score = score_text(&best_text, dictionary);
-
-    // Try systematic pair swaps (characters that might be confused)
-    let swap_pairs = [
-        ('m', 'b'),
-        ('p', 'y'),
-        ('v', 'p'),
-        ('j', 'x'),
-        ('w', 'v'),
-        ('q', 'a'),
-    ];
-
-    // Try each swap and combinations of swaps
-    let mut improved = true;
-    while improved {
-        improved = false;
-
-        for &(c1, c2) in &swap_pairs {
-            let test_text = swap_chars(&best_text, c1, c2);
-            let test_score = score_text(&test_text, dictionary);
-
-            if test_score > best_score {
-                best_score = test_score;
-                best_text = test_text;
-                improved = true;
-            }
-        }
-    }
-
-    best_text
-}
 
 fn swap_chars(text: &str, c1: char, c2: char) -> String {
     text.chars().map(|ch| {
