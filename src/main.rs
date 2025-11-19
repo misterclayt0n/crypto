@@ -502,28 +502,28 @@ fn apply_character_corrections_to_raw(text: &str, dictionary: &HashSet<String>) 
     let mut best_text = text.to_string();
     let mut best_score = score_raw_text(&best_text, dictionary);
 
-    // Try systematic pair swaps on the RAW unsegmented text
-    let swap_pairs = [
-        ('m', 'b'),
-        ('p', 'y'),
-        ('v', 'p'),
-        ('j', 'x'),
-        ('y', 'v'),
-        ('b', 'm'),
-    ];
+    // Try all individual character substitutions (26 letters)
+    let alphabet = "abcdefghijklmnopqrstuvwxyz";
 
-    // Try multiple passes of swaps
-    for _ in 0..3 {
+    // Try multiple passes
+    for _ in 0..5 {
         let mut improved = false;
 
-        for &(c1, c2) in &swap_pairs {
-            let test_text = swap_chars(&best_text, c1, c2);
-            let test_score = score_raw_text(&test_text, dictionary);
+        // Try swapping each letter with every other letter
+        for from_char in alphabet.chars() {
+            for to_char in alphabet.chars() {
+                if from_char == to_char {
+                    continue;
+                }
 
-            if test_score > best_score {
-                best_score = test_score;
-                best_text = test_text;
-                improved = true;
+                let test_text = swap_chars(&best_text, from_char, to_char);
+                let test_score = score_raw_text(&test_text, dictionary);
+
+                if test_score > best_score {
+                    best_score = test_score;
+                    best_text = test_text;
+                    improved = true;
+                }
             }
         }
 
@@ -635,19 +635,51 @@ fn segment_words(text: &str, dictionary: &HashSet<String>) -> String {
 
     words.reverse();
 
-    // Validate: only keep words that exist in dictionary (or are single letters a/i)
+    // Validate and correct: fix words that are close to dictionary words
     let valid_words: Vec<String> = words.iter()
-        .map(|&w| {
+        .filter_map(|&w| {
             if dictionary.contains(w) || w == "a" || w == "i" {
-                w.to_string()
+                Some(w.to_string())
             } else {
-                // Try to further segment this word
-                re_segment_word(w, dictionary)
+                // Try single-character substitutions to fix the word
+                if let Some(corrected) = try_single_char_fix(w, dictionary) {
+                    Some(corrected)
+                } else {
+                    // Try to further segment this word
+                    let segmented = re_segment_word(w, dictionary);
+                    if segmented != w {
+                        Some(segmented)
+                    } else {
+                        None  // Drop words we can't fix
+                    }
+                }
             }
         })
         .collect();
 
     valid_words.join(" ")
+}
+
+fn try_single_char_fix(word: &str, dictionary: &HashSet<String>) -> Option<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let alphabet = "abcdefghijklmnopqrstuvwxyz";
+
+    // Try substituting each position with every letter
+    for i in 0..chars.len() {
+        for replacement in alphabet.chars() {
+            if chars[i] != replacement {
+                let mut test_chars = chars.clone();
+                test_chars[i] = replacement;
+                let test_word: String = test_chars.iter().collect();
+
+                if dictionary.contains(&test_word) {
+                    return Some(test_word);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn re_segment_word(word: &str, dictionary: &HashSet<String>) -> String {
