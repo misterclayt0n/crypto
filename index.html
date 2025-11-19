@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Classical Cipher Visualizer</title>
+</head>
+<body>
+  <header>
+    <h1>Classical Cryptography Visualizer</h1>
+    <p>Explore Vernam, Bitshift, and Vigenère ciphers with hands-on walkthroughs.</p>
+  </header>
+
+  <main>
+    <section class="algorithm" id="vernam">
+      <h2>Vernam Cipher</h2>
+      <p>The Vernam cipher (or one-time pad) combines plaintext with a key using XOR on every bit. When the key is random and at least as long as the message, the cipher is theoretically unbreakable.</p>
+      <div class="how-it-works">
+        <h3>Step-by-step (manual checklist)</h3>
+        <ol>
+          <li>Align plaintext characters with a key of the same length (repeat or trim the key if needed).</li>
+          <li>Convert each character to its 8-bit binary ASCII value.</li>
+          <li>Apply XOR between the plaintext byte and the key byte to produce the cipher byte.</li>
+          <li>Convert each resulting byte back to a character (non-printable bytes are typically represented in hex).</li>
+        </ol>
+      </div>
+      <form id="vernam-form" class="controls">
+        <label>Plaintext
+          <textarea name="plaintext" placeholder="attack at dawn"></textarea>
+        </label>
+        <label>Key
+          <input type="text" name="key" placeholder="lemonlemonle" />
+        </label>
+        <button type="submit">Run Vernam Cipher</button>
+        <p class="note">Note: keys shorter than the message are repeated automatically for visualization.</p>
+      </form>
+      <div class="results">
+        <div id="vernam-result" class="result-line">Cipher Output: —</div>
+        <ol id="vernam-steps" class="step-log"></ol>
+      </div>
+    </section>
+
+    <section class="algorithm" id="bitshift">
+      <h2>Bitshift Cipher</h2>
+      <p>This toy cipher rotates each plaintext byte left or right by a fixed number of bits. Rotations keep all 8 bits but change their positions, scrambling the characters.</p>
+      <div class="how-it-works">
+        <h3>Step-by-step (manual checklist)</h3>
+        <ol>
+          <li>Choose a bit rotation value from 1 to 7 and decide the direction.</li>
+          <li>Convert each character to an 8-bit value.</li>
+          <li>Rotate the bits left or right; bits that fall off one side wrap around to the other.</li>
+          <li>Convert the rotated byte back to a character (or show it as hex if it is non-printable).</li>
+        </ol>
+      </div>
+      <form id="bitshift-form" class="controls">
+        <label>Plaintext
+          <textarea name="plaintext" placeholder="secret"></textarea>
+        </label>
+        <label>Bit shift amount
+          <input type="number" name="shift" min="1" max="7" value="1" />
+        </label>
+        <label>Direction
+          <select name="direction">
+            <option value="left">Left</option>
+            <option value="right">Right</option>
+          </select>
+        </label>
+        <button type="submit">Rotate Bits</button>
+        <p class="note">Visualization uses 8-bit rotation per character so every byte stays intact.</p>
+      </form>
+      <div class="results">
+        <div id="bitshift-result" class="result-line">Shifted Output: —</div>
+        <ol id="bitshift-steps" class="step-log"></ol>
+      </div>
+    </section>
+
+    <section class="algorithm" id="vigenere">
+      <h2>Vigenère Cipher</h2>
+      <p>The Vigenère cipher offsets each letter by a key letter. The key repeats across the text, creating a polyalphabetic substitution.</p>
+      <div class="how-it-works">
+        <h3>Step-by-step (manual checklist)</h3>
+        <ol>
+          <li>Strip the key down to letters (A–Z) and repeat it until it matches your plaintext length.</li>
+          <li>Convert plaintext and key letters to positions (A=0, B=1, ..., Z=25).</li>
+          <li>Add the positions modulo 26 to get the cipher letter index.</li>
+          <li>Convert the numeric result back to a letter for the encrypted text.</li>
+        </ol>
+      </div>
+      <form id="vigenere-form" class="controls">
+        <label>Plaintext
+          <textarea name="plaintext" placeholder="attack at dawn"></textarea>
+        </label>
+        <label>Key (letters only)
+          <input type="text" name="key" placeholder="lemon" />
+        </label>
+        <button type="submit">Encrypt with Vigenère</button>
+        <p class="note">Non-letter symbols pass through untouched so you can track spaces and punctuation.</p>
+      </form>
+      <div class="results">
+        <div id="vigenere-result" class="result-line">Cipher Output: —</div>
+        <ol id="vigenere-steps" class="step-log"></ol>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const formatBinary = (value) => value.toString(2).padStart(8, "0");
+
+    const describeChar = (char) => {
+      if (char === " ") return "space";
+      if (char === "\n") return "\\n";
+      if (char === "\t") return "\\t";
+      return char;
+    };
+
+    const printableOrHex = (value) => {
+      if (value >= 32 && value <= 126) {
+        return '${String.fromCharCode(value)}';
+      }
+      return 0x${value.toString(16).padStart(2, "0")};
+    };
+
+    const sanitizeOutput = (text) => {
+      return Array.from(text)
+        .map((char) => {
+          const code = char.charCodeAt(0);
+          return code >= 32 && code <= 126 ? char : "·";
+        })
+        .join("");
+    };
+
+    const renderSteps = (listEl, steps) => {
+      listEl.innerHTML = "";
+      steps.forEach((step) => {
+        const li = document.createElement("li");
+        li.textContent = step;
+        listEl.appendChild(li);
+      });
+    };
+
+    // --- Vernam visualizer ---
+    document.getElementById("vernam-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const plaintext = form.plaintext.value;
+      const key = form.key.value;
+      const resultEl = document.getElementById("vernam-result");
+      const stepsEl = document.getElementById("vernam-steps");
+
+      if (!plaintext || !key) {
+        resultEl.textContent = "Cipher Output: please supply both plaintext and key.";
+        stepsEl.innerHTML = "";
+        return;
+      }
+
+      const repeatedKey = key.repeat(Math.ceil(plaintext.length / key.length)).slice(0, plaintext.length);
+      const cipherChars = [];
+      const steps = [];
+
+      for (let i = 0; i < plaintext.length; i += 1) {
+        const plainChar = plaintext[i];
+        const keyChar = repeatedKey[i];
+        const plainCode = plainChar.charCodeAt(0);
+        const keyCode = keyChar.charCodeAt(0);
+        const cipherByte = plainCode ^ keyCode;
+        cipherChars.push(String.fromCharCode(cipherByte));
+
+        const stepDescription = Plain '${describeChar(plainChar)}' (${formatBinary(plainCode)}) XOR Key '${describeChar(keyChar)}' (${formatBinary(keyCode)}) -> ${formatBinary(cipherByte)} (${printableOrHex(cipherByte)});
+        steps.push(stepDescription);
+      }
+
+      resultEl.textContent = Cipher Output (non printable shown as ·): ${sanitizeOutput(cipherChars.join(""))};
+      renderSteps(stepsEl, steps);
+    });
+
+    // --- Bitshift visualizer ---
+    const rotateLeft = (value, shift) => ((value << shift) | (value >>> (8 - shift))) & 0xff;
+    const rotateRight = (value, shift) => ((value >>> shift) | (value << (8 - shift))) & 0xff;
+
+    document.getElementById("bitshift-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const plaintext = form.plaintext.value || "";
+      const shift = Number(form.shift.value) || 1;
+      const direction = form.direction.value;
+      const resultEl = document.getElementById("bitshift-result");
+      const stepsEl = document.getElementById("bitshift-steps");
+
+      if (!plaintext) {
+        resultEl.textContent = "Shifted Output: please provide plaintext.";
+        stepsEl.innerHTML = "";
+        return;
+      }
+
+      const steps = [];
+      const shifted = Array.from(plaintext).map((char) => {
+        const code = char.charCodeAt(0);
+        const rotated = direction === "left" ? rotateLeft(code, shift) : rotateRight(code, shift);
+        const stepDescription = Char '${describeChar(char)}' (${formatBinary(code)}) rotate ${direction} ${shift} → ${formatBinary(rotated)} (${printableOrHex(rotated)});
+        steps.push(stepDescription);
+        return String.fromCharCode(rotated);
+      });
+
+      resultEl.textContent = Shifted Output (non printable shown as ·): ${sanitizeOutput(shifted.join(""))};
+      renderSteps(stepsEl, steps);
+    });
+
+    // --- Vigenère visualizer ---
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const letterIndex = (char) => char.toUpperCase().charCodeAt(0) - 65;
+
+    document.getElementById("vigenere-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = event.target;
+      const plaintext = form.plaintext.value || "";
+      const rawKey = form.key.value || "";
+      const resultEl = document.getElementById("vigenere-result");
+      const stepsEl = document.getElementById("vigenere-steps");
+
+      const sanitizedKey = rawKey.replace(/[^a-z]/gi, "").toUpperCase();
+
+      if (!plaintext || !sanitizedKey) {
+        resultEl.textContent = "Cipher Output: please supply plaintext and a letter-only key.";
+        stepsEl.innerHTML = "";
+        return;
+      }
+
+      let keyPointer = 0;
+      const steps = [];
+      const cipherChars = Array.from(plaintext).map((char) => {
+        if (!/[a-z]/i.test(char)) {
+          return char;
+        }
+        const plainIdx = letterIndex(char);
+        const keyChar = sanitizedKey[keyPointer % sanitizedKey.length];
+        const keyIdx = letterIndex(keyChar);
+        const cipherIdx = (plainIdx + keyIdx) % 26;
+        const cipherChar = alphabet[cipherIdx];
+        steps.push(Plain '${char.toUpperCase()}' (${plainIdx}) + Key '${keyChar}' (${keyIdx}) → ${cipherIdx} ('${cipherChar}'));
+        keyPointer += 1;
+        return cipherChar;
+      });
+
+      resultEl.textContent = Cipher Output: ${cipherChars.join("")};
+      renderSteps(stepsEl, steps);
+    });
+  </script>
+</body>
+</html>
