@@ -3,10 +3,14 @@ use std::{
     fs,
     io::{self, Read},
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
+use reqwest::{blocking::Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use rand::Rng;
 
 fn main() -> Result<()> {
@@ -25,6 +29,9 @@ fn main() -> Result<()> {
         let plain = (b'A' + plain_idx as u8) as char;
         println!("{cipher} -> {plain}");
     }
+
+    let refinement = refine_with_llm(&result.plaintext)?;
+    println!("\nLLM response:\n{refinement}");
 
     Ok(())
 }
@@ -333,6 +340,113 @@ impl ScoreModel {
 
         total
     }
+}
+
+const GEMINI_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+fn refine_with_llm(prompt: &str) -> Result<String> {
+    let api_key = std::env::var("GEMINI_API_KEY")
+        .wrap_err("GEMINI_API_KEY environment variable must be set to call Gemini API")?;
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .wrap_err("failed to construct HTTP client")?;
+
+    let request = LlmRequest {
+        contents: vec![LlmContent {
+            parts: vec![LlmPart {
+                text: prompt.to_string(),
+            }],
+        }],
+    };
+
+    let mut delay = Duration::from_secs(1);
+    let max_attempts = 3;
+    let mut last_error = None;
+
+    for attempt in 0..max_attempts {
+        let response = client
+            .post(GEMINI_URL)
+            .header("X-goog-api-key", &api_key)
+            .json(&request)
+            .send()
+            .wrap_err("failed to contact Gemini API")?;
+
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let body = response.text().unwrap_or_default();
+            last_error = Some(eyre!("Gemini API rate limited request: {body}"));
+            if attempt + 1 == max_attempts {
+                break;
+            }
+            thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(8));
+            continue;
+        }
+
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(eyre!("Gemini API returned status {status}: {body}"));
+        }
+
+        let response: LlmResponse = response
+            .json()
+            .wrap_err("failed to parse response from Gemini API")?;
+
+        return response
+            .candidates
+            .and_then(|candidates| {
+                candidates.into_iter().find_map(|candidate| {
+                    candidate.content.and_then(|content| {
+                        content
+                            .parts
+                            .into_iter()
+                            .find_map(|part| part.text)
+                    })
+                })
+            })
+            .ok_or_else(|| eyre!("Gemini API response did not contain text"));
+    }
+
+    Err(last_error.unwrap_or_else(|| eyre!("failed to contact Gemini API")))
+}
+
+#[derive(Serialize)]
+struct LlmRequest {
+    contents: Vec<LlmContent>,
+}
+
+#[derive(Serialize)]
+struct LlmContent {
+    parts: Vec<LlmPart>,
+}
+
+#[derive(Serialize)]
+struct LlmPart {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct LlmResponse {
+    #[serde(default)]
+    candidates: Option<Vec<LlmCandidate>>,
+}
+
+#[derive(Deserialize)]
+struct LlmCandidate {
+    content: Option<LlmContentResponse>,
+}
+
+#[derive(Deserialize)]
+struct LlmContentResponse {
+    #[serde(default)]
+    parts: Vec<LlmPartResponse>,
+}
+
+#[derive(Deserialize)]
+struct LlmPartResponse {
+    text: Option<String>,
 }
 
 const LETTER_FREQ_TABLE: &str = include_str!("../frequency_table/table1.csv");
