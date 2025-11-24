@@ -32,6 +32,8 @@
             pkg-config
             openssl
             rust-analyzer
+            openssl
+            mosquitto
           ];
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
