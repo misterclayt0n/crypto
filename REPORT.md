@@ -109,4 +109,4 @@ By utilizing this approach, we demonstrate a practical example of securely shari
 
 **Add your screenshot here showing the output of the key exchange:**
 
-![Key Exchange Output](../assets/Screenshot from 2025-11-24 11-22-27.png)
+![Key Exchange Output](./assets/something.png)
