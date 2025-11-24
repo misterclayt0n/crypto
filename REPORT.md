@@ -1,5 +1,7 @@
 ### Hybrid RSA-AES Session Key Exchange Simulation (via MQTT)
 
+#### Davi, Rafael
+
 ---
 
 #### **Introduction**
